@@ -156,10 +156,6 @@ int sctrlGetThreadContextByName(const char * name, SceKernelThreadKInfo * ctx);
  */
 void sctrlFlushCache(void);
 
-/**
- * Missing PSPSDK Functions
- */
-u32 sceKernelQuerySystemCall(void * function);
 
 /**
  * Register the default VRAM handler for PSX exploit, returns the previous handler

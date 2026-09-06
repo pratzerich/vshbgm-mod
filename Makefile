@@ -1,4 +1,4 @@
-TARGET = vshbgm
+TARGET = vshbgm-mod
 OBJS = vshbgm.o utils/utils.o external/systemctrl_stubs.o
 
 USE_KERNEL_LIBC = 1
@@ -13,7 +13,7 @@ BUILD_PRX = 1
 PRX_EXPORTS = exports.exp
 PSP_FW_VERSION = 500
 
-LIBS = -lpspaudio -lpspaudiocodec -lpsputility -lpspkernel
+LIBS = -lpspaudio -lpspaudiocodec -lpspctrl -lpsputility -lpspkernel
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build_prx.mak

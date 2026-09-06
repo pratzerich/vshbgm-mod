@@ -1,0 +1,6 @@
+[vshbgm]
+volume = 50
+shuffle = 0
+startup_sound = startup.mp3
+idle_playlist = bgm.m3u
+gameboot_sound = gameboot.mp3

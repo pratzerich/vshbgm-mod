@@ -16,6 +16,7 @@
 #include "utils.h"
 #include <pspaudio.h>
 #include <pspaudiocodec.h>
+#include <pspctrl.h>
 #include <pspkernel.h>
 #include <psprtc.h>
 #include <pspsdk.h>
@@ -25,7 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-PSP_MODULE_INFO("vshbgm", 0x1000, 1, 0);
+PSP_MODULE_INFO("vshbgm-mod", 0x1000, 1, 0);
 PSP_MAIN_THREAD_ATTR(0);
 
 typedef struct {
@@ -35,13 +36,53 @@ typedef struct {
   unsigned long *c_buf;
 } DecodeData;
 
+#define PLAYLIST_MAX_TRACKS 64
+#define PLAYLIST_PATH_MAX 256
+#define BGM_DIRECTORY "ms0:/seplugins/vshbgm/"
+#define CONFIG_PATH "ms0:/seplugins/vshbgm/vshbgm.ini"
+#define GAMEBOOT_TIMEOUT_US 3000000
+
+enum PlaybackMode {
+  PLAYBACK_IDLE,
+  PLAYBACK_STARTUP,
+  PLAYBACK_GAMEBOOT
+};
+
+typedef struct {
+  char tracks[PLAYLIST_MAX_TRACKS][PLAYLIST_PATH_MAX];
+  int count;
+  int next;
+} Playlist;
+
+typedef struct {
+  int volume;
+  int shuffle;
+  char startup_sound[PLAYLIST_PATH_MAX];
+  char idle_playlist[PLAYLIST_PATH_MAX];
+  char gameboot_sound[PLAYLIST_PATH_MAX];
+} Config;
+
 static SceUID bgm_thid = -1;
 static int r_flg = 0, chan = -1, stop = 0;
 static volatile int actv = 0;
 static volatile u32 l_tim = 0;
+static Playlist playlist;
+static Config config;
+static u32 random_state = 0;
+static int playback_enabled = 1;
+static int stop_hotkey_down = 0;
+static int start_hotkey_down = 0;
+static int startup_played = 0;
+static volatile int game_launch_requested = 0;
+static volatile int game_launch_complete = 1;
+static volatile int game_launch_hook_active = 0;
 
 static int (*_glen)(int);
 static int (*_acd)(unsigned long *, int);
+static int (*_loadexec_ms2)(const char *, void *);
+static int (*_loadexec_disc)(const char *, void *);
+static int (*_vsh_loadexec_ms2)(const char *, void *);
+static int (*_vsh_loadexec_disc)(const char *, void *);
 static unsigned long *our_buf = NULL;
 
 void *bgm_memory_alloc(u32 size) {
@@ -260,38 +301,417 @@ static int is_player_active(void) {
 
 static int simple_atoi(const char *s) {
   int res = 0;
+  if (*s < '0' || *s > '9')
+    return -1;
   while (*s >= '0' && *s <= '9') {
     res = res * 10 + (*s - '0');
+    if (res > 100)
+      return 101;
     s++;
   }
-  return res;
+  return *s == '\0' ? res : -1;
 }
 
-static int GetVolume(void) {
-  SceUID fd = sceIoOpen("ms0:/seplugins/vshbgm_volume.txt", PSP_O_RDONLY, 0777);
+static int ReadTextLine(SceUID fd, char *line, int size) {
+  int len = 0;
+  int read = 0;
+  char c;
+
+  while ((read = sceIoRead(fd, &c, 1)) == 1) {
+    if (c == '\n')
+      break;
+    if (c != '\r' && len < size - 1)
+      line[len++] = c;
+  }
+
+  line[len] = '\0';
+  if (len == 0 && read != 1)
+    return -1;
+  return len;
+}
+
+static char *Trim(char *text) {
+  int len;
+  while (*text == ' ' || *text == '\t')
+    text++;
+
+  len = strlen(text);
+  while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t'))
+    text[--len] = '\0';
+  return text;
+}
+
+static int StringEqualsIgnoreCase(const char *left, const char *right) {
+  while (*left && *right) {
+    char a = *left++;
+    char b = *right++;
+    if (a >= 'A' && a <= 'Z')
+      a += 'a' - 'A';
+    if (b >= 'A' && b <= 'Z')
+      b += 'a' - 'A';
+    if (a != b)
+      return 0;
+  }
+  return *left == '\0' && *right == '\0';
+}
+
+static int ParseBoolean(const char *value, int *result) {
+  if (StringEqualsIgnoreCase(value, "1") ||
+      StringEqualsIgnoreCase(value, "true") ||
+      StringEqualsIgnoreCase(value, "yes") ||
+      StringEqualsIgnoreCase(value, "on")) {
+    *result = 1;
+    return 0;
+  }
+  if (StringEqualsIgnoreCase(value, "0") ||
+      StringEqualsIgnoreCase(value, "false") ||
+      StringEqualsIgnoreCase(value, "no") ||
+      StringEqualsIgnoreCase(value, "off")) {
+    *result = 0;
+    return 0;
+  }
+  return -1;
+}
+
+static void SetConfigPath(char *destination, const char *value) {
+  int written = 0;
+  int i;
+
+  destination[0] = '\0';
+  if (!value[0])
+    return;
+
+  if (!strstr(value, ":/") && !strstr(value, ":\\")) {
+    for (i = 0; BGM_DIRECTORY[i] && written < PLAYLIST_PATH_MAX - 1; i++)
+      destination[written++] = BGM_DIRECTORY[i];
+  }
+  for (i = 0; value[i] && written < PLAYLIST_PATH_MAX - 1; i++)
+    destination[written++] = value[i] == '\\' ? '/' : value[i];
+  destination[written] = '\0';
+}
+
+static void WriteDefaultConfig(void) {
+  static const char defaults[] =
+      "[vshbgm]\n"
+      "volume = 50\n"
+      "shuffle = 0\n"
+      "startup_sound = startup.mp3\n"
+      "idle_playlist = bgm.m3u\n"
+      "gameboot_sound = gameboot.mp3\n";
+  SceUID fd = sceIoOpen(CONFIG_PATH,
+                        PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
   if (fd >= 0) {
-    char buf[8];
-    int len = sceIoRead(fd, buf, sizeof(buf) - 1);
+    sceIoWrite(fd, defaults, sizeof(defaults) - 1);
     sceIoClose(fd);
-    if (len > 0) {
-      buf[len] = '\0';
-      int val = simple_atoi(buf);
-      if (val >= 0 && val <= 100)
-        return val;
+  }
+}
+
+static void LoadConfig(Config *settings) {
+  char line[PLAYLIST_PATH_MAX + 32];
+  settings->volume = 50;
+  settings->shuffle = 0;
+  SetConfigPath(settings->startup_sound, "startup.mp3");
+  SetConfigPath(settings->idle_playlist, "bgm.m3u");
+  SetConfigPath(settings->gameboot_sound, "gameboot.mp3");
+
+  SceUID fd = sceIoOpen(CONFIG_PATH, PSP_O_RDONLY, 0777);
+  if (fd < 0) {
+    WriteDefaultConfig();
+    return;
+  }
+
+  while (1) {
+    int len = ReadTextLine(fd, line, sizeof(line));
+    if (len < 0)
+      break;
+
+    char *key = Trim(line);
+    if (!key[0] || key[0] == '#' || key[0] == ';' || key[0] == '[')
+      continue;
+
+    char *equals = strchr(key, '=');
+    if (!equals)
+      continue;
+    *equals = '\0';
+    key = Trim(key);
+    char *value = Trim(equals + 1);
+
+    if (StringEqualsIgnoreCase(key, "volume")) {
+      int volume = simple_atoi(value);
+      if (volume >= 0 && volume <= 100)
+        settings->volume = volume;
+    } else if (StringEqualsIgnoreCase(key, "shuffle")) {
+      ParseBoolean(value, &settings->shuffle);
+    } else if (StringEqualsIgnoreCase(key, "startup_sound")) {
+      SetConfigPath(settings->startup_sound, value);
+    } else if (StringEqualsIgnoreCase(key, "idle_playlist")) {
+      SetConfigPath(settings->idle_playlist, value);
+    } else if (StringEqualsIgnoreCase(key, "gameboot_sound")) {
+      SetConfigPath(settings->gameboot_sound, value);
     }
   }
 
-  fd = sceIoOpen("ms0:/seplugins/vshbgm_volume.txt",
-                 PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-  if (fd >= 0) {
-    sceIoWrite(fd, "50", 2);
-    sceIoClose(fd);
+  sceIoClose(fd);
+}
+
+static void GetPlaylistDirectory(const char *path, char *directory, int size) {
+  int i;
+  int slash = -1;
+
+  for (i = 0; path[i] != '\0' && i < size - 1; i++) {
+    directory[i] = path[i];
+    if (path[i] == '/' || path[i] == '\\')
+      slash = i;
   }
-  return 50;
+
+  if (slash >= 0)
+    directory[slash + 1] = '\0';
+  else
+    directory[0] = '\0';
+}
+
+static void ResolvePlaylistPath(const char *directory, const char *entry,
+                                char *path, int size) {
+  int i = 0;
+  int j = 0;
+
+  if (strstr(entry, ":/") || strstr(entry, ":\\")) {
+    directory = "";
+  } else if (entry[0] == '/' || entry[0] == '\\') {
+    while (directory[i] && directory[i] != ':') {
+      if (j < size - 1)
+        path[j++] = directory[i];
+      i++;
+    }
+    if (directory[i] == ':' && j < size - 1)
+      path[j++] = ':';
+    directory = "";
+  }
+
+  for (i = 0; directory[i] && j < size - 1; i++)
+    path[j++] = directory[i];
+  for (i = 0; entry[i] && j < size - 1; i++)
+    path[j++] = entry[i] == '\\' ? '/' : entry[i];
+  path[j] = '\0';
+}
+
+static int LoadPlaylist(const char *path, Playlist *playlist) {
+  SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
+  if (fd < 0)
+    return -1;
+
+  char directory[PLAYLIST_PATH_MAX];
+  char line[PLAYLIST_PATH_MAX];
+  GetPlaylistDirectory(path, directory, sizeof(directory));
+  playlist->count = 0;
+  playlist->next = 0;
+
+  while (playlist->count < PLAYLIST_MAX_TRACKS) {
+    int len = ReadTextLine(fd, line, sizeof(line));
+    if (len < 0)
+      break;
+    if (len == 0)
+      continue;
+
+    char *entry = line;
+    if (len >= 3 && playlist->count == 0 && (u8)entry[0] == 0xEF &&
+        (u8)entry[1] == 0xBB && (u8)entry[2] == 0xBF)
+      entry += 3;
+
+    while (*entry == ' ' || *entry == '\t')
+      entry++;
+    len = strlen(entry);
+    while (len > 0 && (entry[len - 1] == ' ' || entry[len - 1] == '\t'))
+      entry[--len] = '\0';
+
+    if (!entry[0] || entry[0] == '#')
+      continue;
+
+    ResolvePlaylistPath(directory, entry,
+                        playlist->tracks[playlist->count],
+                        PLAYLIST_PATH_MAX);
+    playlist->count++;
+  }
+
+  sceIoClose(fd);
+  return playlist->count > 0 ? 0 : -1;
+}
+
+static u32 NextRandom(void) {
+  if (!random_state)
+    random_state = sceKernelGetSystemTimeLow() ^ 0xA5A5A5A5;
+  random_state = random_state * 1664525 + 1013904223;
+  return random_state;
+}
+
+static void ShufflePlaylist(Playlist *playlist) {
+  int i;
+  char temporary[PLAYLIST_PATH_MAX];
+
+  random_state ^= sceKernelGetSystemTimeLow();
+  for (i = playlist->count - 1; i > 0; i--) {
+    int other = NextRandom() % (i + 1);
+    if (other == i)
+      continue;
+    memcpy(temporary, playlist->tracks[i], PLAYLIST_PATH_MAX);
+    memcpy(playlist->tracks[i], playlist->tracks[other], PLAYLIST_PATH_MAX);
+    memcpy(playlist->tracks[other], temporary, PLAYLIST_PATH_MAX);
+  }
+}
+
+static void LoadPreferredPlaylist(Playlist *playlist) {
+  playlist->count = 0;
+  playlist->next = 0;
+
+  if (config.idle_playlist[0] &&
+      LoadPlaylist(config.idle_playlist, playlist) == 0) {
+    if (config.shuffle)
+      ShufflePlaylist(playlist);
+    return;
+  }
+  if (LoadPlaylist("ms0:/bgm.m3u", playlist) == 0 && config.shuffle)
+    ShufflePlaylist(playlist);
+}
+
+static int OpenNextTrack(Playlist *playlist, DecodeData *mp3) {
+  int attempts = playlist->count;
+  while (attempts-- > 0) {
+    const char *path = playlist->tracks[playlist->next];
+    playlist->next = (playlist->next + 1) % playlist->count;
+    if (MP3_Init(path, mp3) == 0)
+      return 0;
+  }
+
+  if (MP3_Init("ms0:/seplugins/vshbgm/bgm.mp3", mp3) == 0)
+    return 0;
+  if (MP3_Init("ms0:/bgm.mp3", mp3) == 0)
+    return 0;
+  return -1;
+}
+
+static int RequestGameLaunchCue(void) {
+  u32 started;
+
+  if (game_launch_hook_active || stop || !playback_enabled ||
+      !config.gameboot_sound[0])
+    return 0;
+
+  game_launch_hook_active = 1;
+  game_launch_complete = 0;
+  game_launch_requested = 1;
+  started = sceKernelGetSystemTimeLow();
+
+  while (!game_launch_complete && !stop &&
+         sceKernelGetSystemTimeLow() - started < GAMEBOOT_TIMEOUT_US)
+    sceKernelDelayThread(10000);
+
+  game_launch_requested = 0;
+  game_launch_complete = 1;
+  return 1;
+}
+
+static int LoadExecMs2Patched(const char *file, void *param) {
+  int owns_hook = RequestGameLaunchCue();
+  int result = _loadexec_ms2(file, param);
+  if (owns_hook)
+    game_launch_hook_active = 0;
+  return result;
+}
+
+static int LoadExecDiscPatched(const char *file, void *param) {
+  int owns_hook = RequestGameLaunchCue();
+  int result = _loadexec_disc(file, param);
+  if (owns_hook)
+    game_launch_hook_active = 0;
+  return result;
+}
+
+static int VshLoadExecMs2Patched(const char *file, void *param) {
+  int owns_hook = RequestGameLaunchCue();
+  int result = _vsh_loadexec_ms2(file, param);
+  if (owns_hook)
+    game_launch_hook_active = 0;
+  return result;
+}
+
+static int VshLoadExecDiscPatched(const char *file, void *param) {
+  int owns_hook = RequestGameLaunchCue();
+  int result = _vsh_loadexec_disc(file, param);
+  if (owns_hook)
+    game_launch_hook_active = 0;
+  return result;
+}
+
+static void HookGameLaunch(void) {
+  u32 function;
+
+  if (!_vsh_loadexec_ms2) {
+    function =
+        bgm_find_func("sceVshBridge_Driver", "sceVshBridge", 0x97FB006F);
+    if (function) {
+      _vsh_loadexec_ms2 = (void *)function;
+      sctrlHENPatchSyscall((void *)function, VshLoadExecMs2Patched);
+    }
+  }
+
+  if (!_vsh_loadexec_disc) {
+    function =
+        bgm_find_func("sceVshBridge_Driver", "sceVshBridge", 0xF4873F4D);
+    if (function && (void *)function != (void *)_vsh_loadexec_ms2) {
+      _vsh_loadexec_disc = (void *)function;
+      sctrlHENPatchSyscall((void *)function, VshLoadExecDiscPatched);
+    }
+  }
+
+  if (!_loadexec_ms2) {
+    function = bgm_find_func("sceLoadExec", "LoadExecForKernel", 0x28D0D249);
+    if (!function)
+      function =
+          bgm_find_func("sceLoadExec", "LoadExecForKernel", 0xD940C83C);
+    if (function) {
+      _loadexec_ms2 = (void *)function;
+      sctrlHENPatchSyscall((void *)function, LoadExecMs2Patched);
+    }
+  }
+
+  if (!_loadexec_disc) {
+    function = bgm_find_func("sceLoadExec", "LoadExecForKernel", 0xD8320A28);
+    if (function && (void *)function != (void *)_loadexec_ms2) {
+      _loadexec_disc = (void *)function;
+      sctrlHENPatchSyscall((void *)function, LoadExecDiscPatched);
+    }
+  }
+
+  sceKernelDcacheWritebackAll();
+  sceKernelIcacheClearAll();
+}
+
+static void CheckPlaybackHotkeys(void) {
+  SceCtrlData pad;
+  u32 stop_buttons = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_CIRCLE;
+  u32 start_buttons = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_CROSS;
+
+  if (sceCtrlPeekBufferPositive(&pad, 1) <= 0)
+    return;
+
+  int stop_pressed = (pad.Buttons & stop_buttons) == stop_buttons;
+  int start_pressed = (pad.Buttons & start_buttons) == start_buttons;
+
+  if (stop_pressed && !stop_hotkey_down)
+    playback_enabled = 0;
+  else if (start_pressed && !start_hotkey_down)
+    playback_enabled = 1;
+
+  stop_hotkey_down = stop_pressed;
+  start_hotkey_down = start_pressed;
 }
 
 static int vshbgm_thread(SceSize args, void *argp) {
   DecodeData mp3;
+  int mp3_open = 0;
+  int max_vol = 0;
+  int mode = PLAYBACK_IDLE;
+  u32 retry_time = 0;
   while (!sceKernelFindModuleByName("sceVshCommonUtil_Module"))
     sceKernelDelayThread(100000);
   while (!sceKernelFindModuleByName("scePaf_Module"))
@@ -305,13 +725,10 @@ static int vshbgm_thread(SceSize args, void *argp) {
   sceKernelDelayThread(3000000);
 
 restart:;
-  while (1) {
-    if (MP3_Init("ms0:/seplugins/cxmb/bgm.mp3", &mp3) == 0)
-      break;
-    if (MP3_Init("ms0:/bgm.mp3", &mp3) == 0)
-      break;
-    sceKernelDelayThread(2000000);
-  }
+  LoadConfig(&config);
+  HookGameLaunch();
+  LoadPreferredPlaylist(&playlist);
+  max_vol = (0x8000 * config.volume) / 100;
 
   while (chan < 0 || chan > 7) {
     chan = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, 1152,
@@ -323,11 +740,21 @@ restart:;
   int in_media = 0;
   int check_counter = 0;
 
-  int vol = GetVolume();
-  int max_vol = (0x8000 * vol) / 100;
+  mode = PLAYBACK_IDLE;
+  if (!startup_played) {
+    startup_played = 1;
+    if (config.startup_sound[0] && MP3_Init(config.startup_sound, &mp3) == 0) {
+      mp3_open = 1;
+      mode = PLAYBACK_STARTUP;
+    }
+  }
+  if (!mp3_open && OpenNextTrack(&playlist, &mp3) == 0)
+    mp3_open = 1;
+  retry_time = sceKernelGetSystemTimeLow();
 
   while (!stop) {
     sceKernelDelayThread(10000);
+    CheckPlaybackHotkeys();
 
     if (check_counter++ >= 3) {
       check_counter = 0;
@@ -348,29 +775,78 @@ restart:;
       }
     }
     if (r_flg) {
-      MP3_End(&mp3);
+      if (mp3_open)
+        MP3_End(&mp3);
+      mp3_open = 0;
+      game_launch_requested = 0;
+      game_launch_complete = 1;
       r_flg = 0;
       sceKernelDelayThread(2000000);
       goto restart;
     }
 
-    if (actv) {
+    if (game_launch_requested) {
+      if (mp3_open)
+        MP3_End(&mp3);
+      mp3_open = 0;
+      game_launch_requested = 0;
+      mode = PLAYBACK_GAMEBOOT;
+
+      if (playback_enabled && config.gameboot_sound[0] &&
+          MP3_Init(config.gameboot_sound, &mp3) == 0) {
+        mp3_open = 1;
+      } else {
+        game_launch_complete = 1;
+        mode = PLAYBACK_IDLE;
+        retry_time = sceKernelGetSystemTimeLow();
+      }
+    }
+
+    if (actv && mode != PLAYBACK_GAMEBOOT) {
+      sceKernelDelayThread(100000);
+      continue;
+    }
+
+    if (!playback_enabled) {
+      sceKernelDelayThread(100000);
+      continue;
+    }
+
+    if (!mp3_open) {
+      if (mode == PLAYBACK_GAMEBOOT) {
+        game_launch_complete = 1;
+        mode = PLAYBACK_IDLE;
+      }
+      if (sceKernelGetSystemTimeLow() - retry_time >= 2000000) {
+        LoadPreferredPlaylist(&playlist);
+        if (OpenNextTrack(&playlist, &mp3) == 0)
+          mp3_open = 1;
+        retry_time = sceKernelGetSystemTimeLow();
+      }
       sceKernelDelayThread(100000);
       continue;
     }
 
     int res = MP3_Decode(&mp3);
-    if (res < 0) {
+    if (res != 0) {
+      int finished_mode = mode;
       MP3_End(&mp3);
-      sceKernelDelayThread(2000000);
-      goto restart;
-    }
-    if (res == 1) {
-      MP3_End(&mp3);
-      goto restart;
+      mp3_open = 0;
+
+      if (finished_mode == PLAYBACK_GAMEBOOT)
+        game_launch_complete = 1;
+      mode = PLAYBACK_IDLE;
+
+      if (finished_mode != PLAYBACK_GAMEBOOT &&
+          OpenNextTrack(&playlist, &mp3) == 0)
+        mp3_open = 1;
+      retry_time = sceKernelGetSystemTimeLow();
+      continue;
     }
     sceAudioOutputBlocking(chan, max_vol, mp3.o_buf[mp3.o_num]);
   }
+  if (mp3_open)
+    MP3_End(&mp3);
   return 0;
 }
 
@@ -384,6 +860,8 @@ int module_start(SceSize args, void *argp) {
 
 int module_stop(SceSize args, void *argp) {
   stop = 1;
+  game_launch_requested = 0;
+  game_launch_complete = 1;
   sceKernelDelayThread(100000);
   if (chan >= 0) {
     sceAudioChRelease(chan);
@@ -393,6 +871,26 @@ int module_stop(SceSize args, void *argp) {
     sctrlHENPatchSyscall((void *)_acd, (void *)_acd);
     _acd = NULL;
   }
+  if (_loadexec_ms2) {
+    sctrlHENPatchSyscall((void *)_loadexec_ms2, (void *)_loadexec_ms2);
+    _loadexec_ms2 = NULL;
+  }
+  if (_loadexec_disc) {
+    sctrlHENPatchSyscall((void *)_loadexec_disc, (void *)_loadexec_disc);
+    _loadexec_disc = NULL;
+  }
+  if (_vsh_loadexec_ms2) {
+    sctrlHENPatchSyscall((void *)_vsh_loadexec_ms2,
+                         (void *)_vsh_loadexec_ms2);
+    _vsh_loadexec_ms2 = NULL;
+  }
+  if (_vsh_loadexec_disc) {
+    sctrlHENPatchSyscall((void *)_vsh_loadexec_disc,
+                         (void *)_vsh_loadexec_disc);
+    _vsh_loadexec_disc = NULL;
+  }
+  sceKernelDcacheWritebackAll();
+  sceKernelIcacheClearAll();
   if (bgm_thid >= 0) {
     sceKernelWaitThreadEnd(bgm_thid, NULL);
     sceKernelDeleteThread(bgm_thid);
