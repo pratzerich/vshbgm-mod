@@ -2,12 +2,12 @@
     "pkgver": 1,
     "type": "plugin",
     "name": "vshbgm-mod",
-    "author": "bdjabbari",
-    "description": "Plays a looping tune playlist on the vsh",
-    "link": "https://github.com/bdjabbari/vshbgm",
+    "author": "thePratz",
+    "description": "Plays a looping tune playlist on the vsh and a tune on startup and load game",
+    "link": "https://github.com/pratzerich/vshbgm-mod",
     "version": "1.0",
     "download": {
-       "remote": "github:bdjabbari/vshbgm/releases/latest/download/vshbgm-mod.prx",
+       "remote": "github:pratzerich/vshbgm-mod/releases/latest/download/vshbgm-mod.prx",
        "compressed": false,
        "targets": [
           { "file": "vshbgm-mod.prx", "target": "ms0:/SEPLUGINS/vshbgm/vshbgm-mod.prx" }
